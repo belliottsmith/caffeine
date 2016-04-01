@@ -20,6 +20,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.ThreadSafe;
 
 /**
@@ -94,5 +95,11 @@ public interface AsyncCacheLoader<K, V> {
   default CompletableFuture<V> asyncReload(
       @Nonnull K key, @Nonnull V oldValue, @Nonnull Executor executor) {
     return asyncLoad(key, executor);
+  }
+
+  /** FIXME */
+  default boolean retainOnConflict(K key,
+      @Nullable V currentValue, @Nullable V oldValue, @Nullable V newValue) {
+    return false;
   }
 }

@@ -90,6 +90,11 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
   }
 
   @Override
+  public V getIfPresentQuietly(Object key) {
+    return data.get(key);
+  }
+
+  @Override
   public long estimatedSize() {
     return data.mappingCount();
   }
@@ -123,18 +128,20 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
     return statsCounter;
   }
 
-  void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
-    requireNonNull(removalListener, "Notification should be guarded with a check");
-    executor.execute(() -> removalListener.onRemoval(key, value, cause));
-  }
-
-  boolean hasRemovalListener() {
+  @Override
+  public boolean hasRemovalListener() {
     return (removalListener != null);
   }
 
   @Override
   public RemovalListener<K, V> removalListener() {
     return removalListener;
+  }
+
+  @Override
+  public void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
+    requireNonNull(removalListener, "Notification should be guarded with a check");
+    executor.execute(() -> removalListener.onRemoval(key, value, cause));
   }
 
   @Override
@@ -198,13 +205,15 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
 
   @Override
   public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
-      boolean isAsync) {
+      boolean recordStats, boolean recordLoad) {
     requireNonNull(mappingFunction);
 
     // optimistic fast path due to computeIfAbsent always locking
     V value = data.get(key);
     if (value != null) {
-      statsCounter.recordHits(1);
+      if (recordStats) {
+        statsCounter.recordHits(1);
+      }
       return value;
     }
 
@@ -212,9 +221,11 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
     value = data.computeIfAbsent(key, k -> {
       // Do not communicate to CacheWriter on a load
       missed[0] = true;
-      return statsAware(mappingFunction, isAsync).apply(key);
+      return recordStats
+          ? statsAware(mappingFunction, recordLoad).apply(key)
+          : mappingFunction.apply(key);
     });
-    if (!missed[0]) {
+    if (!missed[0] && recordStats) {
       statsCounter.recordHits(1);
     }
     return value;
@@ -235,7 +246,9 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
     V[] oldValue = (V[]) new Object[1];
     RemovalCause[] cause = new RemovalCause[1];
     V nv = data.computeIfPresent(key, (K k, V value) -> {
-      V newValue = statsAware(remappingFunction, false, false).apply(k, value);
+      BiFunction<? super K, ? super V, ? extends V> function =
+          statsAware(remappingFunction, /* recordMiss */ false, /* recordLoad */ true);
+      V newValue = function.apply(k, value);
 
       cause[0] = (newValue == null) ? RemovalCause.EXPLICIT : RemovalCause.REPLACED;
       if (hasRemovalListener() && (newValue != value)) {
@@ -252,9 +265,9 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
 
   @Override
   public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
-      boolean recordMiss, boolean isAsync) {
+      boolean recordMiss, boolean recordLoad) {
     requireNonNull(remappingFunction);
-    return remap(key, statsAware(remappingFunction, recordMiss, isAsync));
+    return remap(key, statsAware(remappingFunction, recordMiss, recordLoad));
   }
 
   @Override
@@ -337,23 +350,22 @@ final class UnboundedLocalCache<K, V> implements LocalCache<K, V> {
 
   @Override
   public V put(K key, V value) {
-    return put(key, value, true);
-  }
-
-  @Override
-  public V put(K key, V value, boolean notifyWriter) {
     requireNonNull(value);
 
     // ensures that the removal notification is processed after the removal has completed
     @SuppressWarnings({"unchecked", "rawtypes"})
     V oldValue[] = (V[]) new Object[1];
-    data.compute(key, (k, v) -> {
-      if (notifyWriter && (value != v)) {
-        writer.write(key, value);
-      }
-      oldValue[0] = v;
-      return value;
-    });
+    if (writer == CacheWriter.disabledWriter()) {
+      oldValue[0] = data.put(key, value);
+    } else {
+      data.compute(key, (k, v) -> {
+        if (value != v) {
+          writer.write(key, value);
+        }
+        oldValue[0] = v;
+        return value;
+      });
+    }
 
     if (hasRemovalListener() && (oldValue[0] != null) && (oldValue[0] != value)) {
       notifyRemoval(key, oldValue[0], RemovalCause.REPLACED);

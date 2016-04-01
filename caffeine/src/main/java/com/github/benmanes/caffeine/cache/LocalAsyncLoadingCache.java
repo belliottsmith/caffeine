@@ -114,6 +114,11 @@ abstract class LocalAsyncLoadingCache<C extends LocalCache<K, CompletableFuture<
   @Override
   public CompletableFuture<V> get(K key,
       BiFunction<? super K, Executor, CompletableFuture<V>> mappingFunction) {
+    return get(key, mappingFunction, true);
+  }
+
+  CompletableFuture<V> get(K key,
+      BiFunction<? super K, Executor, CompletableFuture<V>> mappingFunction, boolean recordStats) {
     long startTime = cache.statsTicker().read();
     @SuppressWarnings({"unchecked", "rawtypes"})
     CompletableFuture<V>[] result = new CompletableFuture[1];
@@ -123,7 +128,7 @@ abstract class LocalAsyncLoadingCache<C extends LocalCache<K, CompletableFuture<
         cache.statsCounter().recordLoadFailure(cache.statsTicker().read() - startTime);
       }
       return result[0];
-    }, true);
+    }, recordStats, /* recordLoad */ false);
     if (result[0] != null) {
       AtomicBoolean completed = new AtomicBoolean();
       result[0].whenComplete((value, error) -> {
@@ -443,38 +448,37 @@ abstract class LocalAsyncLoadingCache<C extends LocalCache<K, CompletableFuture<
     public void refresh(K key) {
       requireNonNull(key);
 
-      BiFunction<K, CompletableFuture<V>, CompletableFuture<V>> refreshFunction =
-          (k, oldValueFuture) -> {
-            try {
-              V oldValue = Async.getWhenSuccessful(oldValueFuture);
-              if (loader instanceof CacheLoader<?, ?>) {
-                CacheLoader<K, V> cacheLoader = (CacheLoader<K, V>) loader;
-                V newValue = (oldValue == null)
-                    ? cacheLoader.load(key)
-                    : cacheLoader.reload(key, oldValue);
-                return (newValue == null) ? null : CompletableFuture.completedFuture(newValue);
-              } else {
-                // Hint that the async task should be run on this async task's thread
-                CompletableFuture<V> newValueFuture = (oldValue == null)
-                    ? loader.asyncLoad(key, Runnable::run)
-                    : loader.asyncReload(key, oldValue, Runnable::run);
-                V newValue = newValueFuture.get();
-                return (newValue == null) ? null : newValueFuture;
-              }
-            } catch (InterruptedException e) {
-              Thread.currentThread().interrupt();
-              return LocalCache.throwUnchecked(e);
-            } catch (ExecutionException e) {
-              return LocalCache.throwUnchecked(e.getCause());
-            } catch (Exception e) {
-              return LocalCache.throwUnchecked(e);
-            }
-          };
-      cache.executor().execute(() -> {
-        try {
-          cache.compute(key, refreshFunction, false, false);
-        } catch (Throwable t) {
-          logger.log(Level.WARNING, "Exception thrown during refresh", t);
+      CompletableFuture<V> oldValueFuture = cache.getIfPresentQuietly(key);
+      if (oldValueFuture == null) {
+        LocalAsyncLoadingCache.this.get(key, loader::asyncLoad, false);
+        return;
+      } else if (!Async.isReady(oldValueFuture)) {
+        // no-op if load is pending
+        return;
+      }
+
+      V oldValue = oldValueFuture.join();
+      long now = cache.statsTicker().read();
+      CompletableFuture<V> refreshFuture = loader.asyncReload(key, oldValue, cache.executor());
+      refreshFuture.whenComplete((newValue, error) -> {
+        long loadTime = cache.statsTicker().read() - now;
+        if (error != null) {
+          logger.log(Level.WARNING, "Exception thrown during refresh", error);
+          cache.statsCounter().recordLoadFailure(loadTime);
+          return;
+        }
+        boolean[] removed = new boolean[1];
+        cache.statsCounter().recordLoadSuccess(loadTime);
+        cache.compute(key, (k, currentValueFuture) -> {
+          V currentValue = Async.getWhenSuccessful(currentValueFuture);
+          if ((currentValue == oldValue)
+              || loader.retainOnConflict(key, currentValue, oldValue, newValue)) {
+            return (newValue == null) ? null : refreshFuture;
+          }
+          return currentValueFuture;
+        }, /* recordMiss */ false, /* recordLoad */ false);
+        if (removed[0] && cache.hasRemovalListener()) {
+          cache.notifyRemoval(key, refreshFuture, RemovalCause.CONFLICT);
         }
       });
     }
@@ -630,7 +634,7 @@ abstract class LocalAsyncLoadingCache<C extends LocalCache<K, CompletableFuture<
         }
         delegate.statsCounter().recordLoadSuccess(loadTime);
         return CompletableFuture.completedFuture(newValue);
-      }, false, true);
+      }, /* recordMiss */ false, /* recordLoad */ false);
       return Async.getWhenSuccessful(valueFuture);
     }
 

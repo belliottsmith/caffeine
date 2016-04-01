@@ -93,6 +93,13 @@ public enum RemovalCause {
     }
   },
 
+  /** FIXME */
+  CONFLICT {
+    @Override public boolean wasEvicted() {
+      return false;
+    }
+  },
+
   /**
    * The entry was evicted due to size constraints. This can occur when using
    * {@link Caffeine#maximumSize} or {@link Caffeine#maximumWeight}.

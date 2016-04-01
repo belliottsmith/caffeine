@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.concurrent.ExecutionException;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import com.github.benmanes.caffeine.cache.CacheLoader;
 import com.google.common.base.Throwables;
@@ -161,6 +162,12 @@ final class CaffeinatedGuavaLoadingCache<K, V> extends CaffeinatedGuavaCache<K, 
       } catch (Exception e) {
         throw Throwables.propagate(e);
       }
+    }
+
+    @Override
+    public boolean retainOnConflict(K key,
+        @Nullable V currentValue, @Nullable V oldValue, @Nullable V newValue) {
+      return true;
     }
   }
 

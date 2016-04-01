@@ -25,8 +25,8 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
-import java.util.function.BiFunction;
 import java.util.function.Function;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -44,6 +44,7 @@ interface LocalLoadingCache<C extends LocalCache<K, V>, K, V>
   /** Returns the {@link CacheLoader} used by this cache. */
   CacheLoader<? super K, V> cacheLoader();
 
+  /** Returns the {@link CacheLoader} as a mapping function. */
   Function<K, V> mappingFunction();
 
   /** Returns whether the cache loader supports bulk loading. */
@@ -131,7 +132,18 @@ interface LocalLoadingCache<C extends LocalCache<K, V>, K, V>
       @SuppressWarnings("unchecked")
       Map<K, V> loaded = (Map<K, V>) cacheLoader().loadAll(keysToLoad);
       loaded.forEach((key, value) -> {
-        cache().put(key, value, /* notifyWriter */ false);
+        boolean[] conflict = new boolean[1];
+        cache().compute(key, (k, currentValue) -> {
+          if ((currentValue == null)
+              || cacheLoader().retainOnConflict(key, currentValue, /* oldValue */ null, value)) {
+            return value;
+          }
+          conflict[0] = true;
+          return currentValue;
+        }, /* recordMiss */ false, /* recordLoad */ false);
+        if (conflict[0] && cache().hasRemovalListener()) {
+          cache().notifyRemoval(key, value, RemovalCause.CONFLICT);
+        }
         if (keysToLoad.contains(key)) {
           result.put(key, value);
         }
@@ -154,23 +166,31 @@ interface LocalLoadingCache<C extends LocalCache<K, V>, K, V>
   @Override
   default void refresh(K key) {
     requireNonNull(key);
-    cache().executor().execute(() -> {
-      BiFunction<? super K, ? super V, ? extends V> refreshFunction = (k, oldValue) -> {
-        try {
-          return (oldValue == null)
-              ? cacheLoader().load(key)
-              : cacheLoader().reload(key, oldValue);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          return LocalCache.throwUnchecked(e);
-        } catch (Exception e) {
-          return LocalCache.throwUnchecked(e);
+
+    long startTime = cache().statsTicker().read();
+    V oldValue = cache().getIfPresentQuietly(key);
+    CompletableFuture<V> refreshFuture = (oldValue == null)
+        ? cacheLoader().asyncLoad(key, cache().executor())
+        : cacheLoader().asyncReload(key, oldValue, cache().executor());
+    refreshFuture.whenComplete((newValue, error) -> {
+      long loadTime = cache().statsTicker().read() - startTime;
+      if (error != null) {
+        logger.log(Level.WARNING, "Exception thrown during refresh", error);
+        cache().statsCounter().recordLoadFailure(loadTime);
+        return;
+      }
+      boolean[] removed = new boolean[1];
+      cache().statsCounter().recordLoadSuccess(loadTime);
+      cache().compute(key, (k, currentValue) -> {
+        if ((currentValue == oldValue)
+            || cacheLoader().retainOnConflict(key, currentValue, oldValue, newValue)) {
+          return newValue;
         }
-      };
-      try {
-        cache().compute(key, refreshFunction, false, false);
-      } catch (Throwable t) {
-        logger.log(Level.WARNING, "Exception thrown during refresh", t);
+        removed[0] = true;
+        return currentValue;
+      }, /* recordMiss */ false, /* recordLoad */ false);
+      if (removed[0] && cache().hasRemovalListener()) {
+        cache().notifyRemoval(key, newValue, RemovalCause.CONFLICT);
       }
     });
   }

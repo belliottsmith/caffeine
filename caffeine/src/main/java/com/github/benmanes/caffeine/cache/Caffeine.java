@@ -379,7 +379,7 @@ public final class Caffeine<K, V> {
   }
 
   boolean evicts() {
-    return getMaximumWeight() != UNSET_INT;
+    return getMaximum() != UNSET_INT;
   }
 
   boolean isWeighted() {
@@ -387,7 +387,7 @@ public final class Caffeine<K, V> {
   }
 
   @Nonnegative
-  long getMaximumWeight() {
+  long getMaximum() {
     return (weigher == null) ? maximumSize : maximumWeight;
   }
 

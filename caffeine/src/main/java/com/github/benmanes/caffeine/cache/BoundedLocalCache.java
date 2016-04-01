@@ -171,7 +171,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     drainBuffersTask = this::performCleanUp;
 
     if (evicts()) {
-      setMaximum(builder.getMaximumWeight());
+      setMaximum(builder.getMaximum());
     }
   }
 
@@ -245,13 +245,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     return null;
   }
 
-  /** Returns whether this cache notifies when an entry is removed. */
-  protected boolean hasRemovalListener() {
+  @Override
+  public boolean hasRemovalListener() {
     return false;
   }
 
-  /** Asynchronously sends a removal notification to the listener. */
-  void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
+  @Override
+  public void notifyRemoval(@Nullable K key, @Nullable V value, RemovalCause cause) {
     requireState(hasRemovalListener(), "Notification should be guarded with a check");
     Runnable task = () -> {
       try {
@@ -762,45 +762,63 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     if (!refreshAfterWrite()) {
       return;
     }
+    K key;
+    V oldValue;
     long oldWriteTime = node.getWriteTime();
     long refreshWriteTime = isAsync ? Long.MAX_VALUE : now;
     if (((now - oldWriteTime) > refreshAfterWriteNanos())
+        && ((key = node.getKey()) != null) && ((oldValue = node.getValue()) != null)
         && node.casWriteTime(oldWriteTime, refreshWriteTime)) {
       try {
-        executor().execute(() -> {
-          K key = node.getKey();
-          if ((key != null) && node.isAlive()) {
-            BiFunction<? super K, ? super V, ? extends V> refreshFunction = (k, v) -> {
-              if (node.getWriteTime() != refreshWriteTime) {
-                return v;
+        CompletableFuture<V> refreshFuture;
+        if (isAsync) {
+          @SuppressWarnings("unchecked")
+          CompletableFuture<V> future = (CompletableFuture<V>) oldValue;
+          refreshFuture = future.thenCompose(value ->
+             cacheLoader.asyncReload(node.getKey(), value, executor));
+        } else {
+          refreshFuture = cacheLoader.asyncReload(node.getKey(), oldValue, executor);
+        }
+        refreshFuture.whenComplete((newValue, error) -> {
+          long loadTime = statsTicker().read() - now;
+          if (error != null) {
+            logger.log(Level.WARNING, "Exception thrown during refresh", error);
+            node.casWriteTime(refreshWriteTime, oldWriteTime);
+            statsCounter().recordLoadFailure(loadTime);
+            return;
+          }
+          boolean[] removed = new boolean[1];
+          statsCounter().recordLoadSuccess(loadTime);
+          compute(key, (k, currentValue) -> {
+            if (isAsync) {
+              @SuppressWarnings("unchecked")
+              V newValueFuture = (V) refreshFuture;
+
+              if (currentValue == oldValue) {
+                return (newValue == null) ? null : newValueFuture;
               }
-              try {
-                if (isAsync) {
-                  @SuppressWarnings("unchecked")
-                  V oldValue = ((CompletableFuture<V>) v).join();
-                  CompletableFuture<V> future =
-                      cacheLoader.asyncReload(key, oldValue, Runnable::run);
-                  if (future.join() == null) {
-                    return null;
-                  }
-                  @SuppressWarnings("unchecked")
-                  V castFuture = (V) future;
-                  return castFuture;
-                }
-                return cacheLoader.reload(k, v);
-              } catch (Exception e) {
-                node.setWriteTime(oldWriteTime);
-                return LocalCache.throwUnchecked(e);
+              @SuppressWarnings("unchecked")
+              V current = Async.getWhenSuccessful((CompletableFuture<V>) currentValue);
+              if (cacheLoader.retainOnConflict(key, current, oldValue, newValue)) {
+                return (newValue == null) ? null : newValueFuture;
               }
-            };
-            try {
-              computeIfPresent(key, refreshFunction);
-            } catch (Throwable t) {
-              logger.log(Level.WARNING, "Exception thrown during refresh", t);
+              removed[0] = true;
+              return currentValue;
             }
+
+            if ((currentValue == oldValue)
+                || cacheLoader.retainOnConflict(key, currentValue, oldValue, newValue)) {
+              return newValue;
+            }
+            removed[0] = true;
+            return currentValue;
+          }, /* recordMiss */ false, /* recordLoad */ false);
+          if (removed[0] && hasRemovalListener()) {
+            notifyRemoval(key, newValue, RemovalCause.CONFLICT);
           }
         });
       } catch (Throwable t) {
+        node.casWriteTime(refreshWriteTime, oldWriteTime);
         logger.log(Level.SEVERE, "Exception thrown when submitting refresh task", t);
       }
     }
@@ -1316,6 +1334,12 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   }
 
   @Override
+  public V getIfPresentQuietly(Object key) {
+    Node<K, V> node = data.get(nodeFactory.newLookupKey(key));
+    return (node == null) || hasExpired(node, expirationTicker().read()) ? null : node.getValue();
+  }
+
+  @Override
   public Map<K, V> getAllPresent(Iterable<?> keys) {
     int misses = 0;
     long now = expirationTicker().read();
@@ -1344,24 +1368,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
   public V put(K key, V value) {
     int weight = weigher.weigh(key, value);
     return (weight > 0)
-        ? putFast(key, value, weight, true, false)
-        : putSlow(key, value, weight, true, false);
-  }
-
-  @Override
-  public V put(K key, V value, boolean notifyWriter) {
-    int weight = weigher.weigh(key, value);
-    return (weight > 0)
-        ? putFast(key, value, weight, notifyWriter, false)
-        : putSlow(key, value, weight, notifyWriter, false);
+        ? putFast(key, value, weight, false)
+        : putSlow(key, value, weight, false);
   }
 
   @Override
   public V putIfAbsent(K key, V value) {
     int weight = weigher.weigh(key, value);
     return (weight > 0)
-        ? putFast(key, value, weight, true, true)
-        : putSlow(key, value, weight, true, true);
+        ? putFast(key, value, weight, true)
+        : putSlow(key, value, weight, true);
   }
 
   /**
@@ -1375,11 +1391,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    *
    * @param key key with which the specified value is to be associated
    * @param value value to be associated with the specified key
-   * @param notifyWriter if the writer should be notified for an inserted or updated entry
    * @param onlyIfAbsent a write is performed only if the key is not already associated with a value
    * @return the prior value in the data store or null if no mapping was found
    */
-  V putFast(K key, V value, int newWeight, boolean notifyWriter, boolean onlyIfAbsent) {
+  V putFast(K key, V value, int newWeight, boolean onlyIfAbsent) {
     requireNonNull(key);
     requireNonNull(value);
     requireState(newWeight != 0);
@@ -1395,7 +1410,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           node = nodeFactory.newNode(key, keyReferenceQueue(),
               value, valueReferenceQueue(), newWeight, now);
         }
-        if (notifyWriter && hasWriter()) {
+        if (hasWriter()) {
           Node<K, V> computed = node;
           prior = data.computeIfAbsent(node.getKeyReference(), k -> {
             writer.write(key, value);
@@ -1433,7 +1448,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           mayUpdate = false;
         }
 
-        if (notifyWriter && (expired || (mayUpdate && (value != oldValue)))) {
+        if (expired || (mayUpdate && (value != oldValue))) {
           writer.write(key, value);
         }
         if (mayUpdate) {
@@ -1474,11 +1489,10 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
    *
    * @param key key with which the specified value is to be associated
    * @param value value to be associated with the specified key
-   * @param notifyWriter if the writer should be notified for an inserted or updated entry
    * @param onlyIfAbsent a write is performed only if the key is not already associated with a value
    * @return the prior value in the data store or null if no mapping was found
    */
-  V putSlow(K key, V value, int newWeight, boolean notifyWriter, boolean onlyIfAbsent) {
+  V putSlow(K key, V value, int newWeight, boolean onlyIfAbsent) {
     requireNonNull(key);
     requireNonNull(value);
 
@@ -1494,9 +1508,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
     Node<K, V> node = data.compute(keyRef, (kr, n) -> {
       if (n == null) {
-        if (notifyWriter) {
-          writer.write(key, value);
-        }
+        writer.write(key, value);
         return nodeFactory.newNode(kr, value, valueReferenceQueue(), newWeight, now);
       }
 
@@ -1519,9 +1531,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
           if (cause[0] == null) {
             cause[0] = RemovalCause.REPLACED;
           }
-          if (notifyWriter) {
-            writer.write(key, value);
-          }
+          writer.write(key, value);
         }
 
         n.setValue(value, valueReferenceQueue());
@@ -1763,7 +1773,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
   @Override
   public V computeIfAbsent(K key, Function<? super K, ? extends V> mappingFunction,
-      boolean isAsync) {
+      boolean recordStats, boolean recordLoad) {
     requireNonNull(key);
     requireNonNull(mappingFunction);
     long now = expirationTicker().read();
@@ -1777,13 +1787,16 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         return value;
       }
     }
+    if (recordStats) {
+      mappingFunction = statsAware(mappingFunction, recordLoad);
+    }
     Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
-    return doComputeIfAbsent(key, keyRef, mappingFunction, isAsync, now);
+    return doComputeIfAbsent(key, keyRef, mappingFunction, now);
   }
 
   /** Returns the current value from a computeIfAbsent invocation. */
-  V doComputeIfAbsent(K key, Object keyRef, Function<? super K, ? extends V> mappingFunction,
-      boolean isAsync, long now) {
+  V doComputeIfAbsent(K key, Object keyRef,
+      Function<? super K, ? extends V> mappingFunction, long now) {
     @SuppressWarnings("unchecked")
     V[] oldValue = (V[]) new Object[1];
     @SuppressWarnings("unchecked")
@@ -1797,7 +1810,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     RemovalCause[] cause = new RemovalCause[1];
     Node<K, V> node = data.compute(keyRef, (k, n) -> {
       if (n == null) {
-        newValue[0] = statsAware(mappingFunction, isAsync).apply(key);
+        newValue[0] = mappingFunction.apply(key);
         if (newValue[0] == null) {
           return null;
         }
@@ -1821,7 +1834,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         }
 
         writer.delete(nodeKey[0], oldValue[0], cause[0]);
-        newValue[0] = statsAware(mappingFunction, isAsync).apply(key);
+        newValue[0] = mappingFunction.apply(key);
         if (newValue[0] == null) {
           removed[0] = n;
           n.retire();
@@ -1878,13 +1891,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
 
     boolean computeIfAbsent = false;
     BiFunction<? super K, ? super V, ? extends V> statsAwareRemappingFunction =
-        statsAware(remappingFunction, false, false);
+        statsAware(remappingFunction, /* recordMiss */ false, /* recordLoad */ true);
     return remap(key, lookupKey, statsAwareRemappingFunction, now, computeIfAbsent);
   }
 
   @Override
   public V compute(K key, BiFunction<? super K, ? super V, ? extends V> remappingFunction,
-      boolean recordMiss, boolean isAsync) {
+      boolean recordMiss, boolean recordLoad) {
     requireNonNull(key);
     requireNonNull(remappingFunction);
 
@@ -1892,7 +1905,7 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
     boolean computeIfAbsent = true;
     Object keyRef = nodeFactory.newReferenceKey(key, keyReferenceQueue());
     BiFunction<? super K, ? super V, ? extends V> statsAwareRemappingFunction =
-        statsAware(remappingFunction, recordMiss, isAsync);
+        statsAware(remappingFunction, recordMiss, recordLoad);
     return remap(key, keyRef, statsAwareRemappingFunction, now, computeIfAbsent);
   }
 

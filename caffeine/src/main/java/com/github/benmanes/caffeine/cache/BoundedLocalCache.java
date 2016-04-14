@@ -41,13 +41,7 @@ import java.util.OptionalLong;
 import java.util.Queue;
 import java.util.Set;
 import java.util.Spliterator;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CompletionException;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executor;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.ForkJoinTask;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.BiFunction;
@@ -589,11 +583,19 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
         continue;
       }
 
+      // Select a random value to check frequency against, to decide if the candidate qualifies for entry into the cache;
+      // in 75% of cases this will be the victim, in 12.5% the next victim, in 6.25% the next, etc
+      Node<K, V> guard = victim;
+      int guardDistance = Integer.numberOfTrailingZeros(ThreadLocalRandom.current().nextInt()) / 2;
+      while (guard.getKey() == null || guardDistance-- > 0) {
+        guard = guard.getNextInAccessOrder();
+      }
+
       // Evict the entry with the lowest frequency
       candidates--;
-      int victimFreq = frequencySketch().frequency(victimHash);
+      int guardFreq = frequencySketch().frequency(guard == victim ? victimHash : guard.getKey().hashCode());
       int candidateFreq = frequencySketch().frequency(candidateHash);
-      if (candidateFreq > victimFreq) {
+      if (candidateFreq > guardFreq) {
         Node<K, V> evict = victim;
         victim = victim.getNextInAccessOrder();
         evictEntry(evict, RemovalCause.SIZE, 0L);

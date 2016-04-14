@@ -584,11 +584,13 @@ abstract class BoundedLocalCache<K, V> extends BLCHeader.DrainStatusRef<K, V>
       }
 
       // Select a random value to check frequency against, to decide if the candidate qualifies for entry into the cache;
-      // in 75% of cases this will be the victim, in 12.5% the next victim, in 6.25% the next, etc
-      Node<K, V> guard = victim;
+      // in 75% of cases this will be the victim, in 12.5% the next victim, in 6.25% the next, etc, with a max of 16
+      Node<K, V> guard = victim, next = guard;
       int guardDistance = Integer.numberOfTrailingZeros(ThreadLocalRandom.current().nextInt()) / 2;
-      while (guard.getKey() == null || guardDistance-- > 0) {
-        guard = guard.getNextInAccessOrder();
+      while (guardDistance-- > 0 && (next = next.getNextInAccessOrder()) != null) {
+        if (next.getKey() != null) {
+          guard = next;
+        }
       }
 
       // Evict the entry with the lowest frequency
